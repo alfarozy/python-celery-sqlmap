@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  flask-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    depends_on:
+      - rabbitmq
+    environment:
+      - CELERY_BROKER_URL=pyamqp://guest@rabbitmq//
+      - CELERY_RESULT_BACKEND=rpc://
+    volumes:
+      - ./:/app
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    command: celery -A app.app.celery worker --loglevel=info --concurrency=2
+    environment:
+      - CELERY_BROKER_URL=pyamqp://guest@rabbitmq//
+      - CELERY_RESULT_BACKEND=rpc://
+    volumes:
+      - ./:/app
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    tmpfs:
+      - /var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      retries: 5
+      start_period: 30s
+      timeout: 5s
