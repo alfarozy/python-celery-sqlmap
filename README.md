@@ -11,17 +11,17 @@ A Python-based automation tool that integrates SQLMap with Celery for automated 
 ## Installation
 
 ### 1. Clone Repository
-    ```bash
+    
     git clone https://github.com/username/sqlmap-celery.git
     cd sqlmap-celery
-    ```
+    
 ### 2. Build 
-    ```bash
+    
     docker compose build && docker compose up -d
-    ```
+    
 
-### 3. Deploy
-    - API SQLMap : http://127.0.0.1:5000
+### 3. API SQLMap
+    http://127.0.0.1:5000
 
 ## Author
  - Koji Xenpai a.k.a (Alfarozy)
