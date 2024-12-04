@@ -1,0 +1,8 @@
+FROM mher/flower:0.9.7
+
+# Set working directory in container
+WORKDIR /app
+# Copy the application code into the container
+COPY . /app/
+# Copy requirements.txt and install dependencies
+RUN pip install --no-cache-dir -r requirements.txt
