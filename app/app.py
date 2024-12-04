@@ -3,7 +3,8 @@ from celery import Celery, signals
 import subprocess
 import os
 import json
-from celery.app.control import Inspect
+import redis
+from celery.exceptions import MaxRetriesExceededError
 
 app = Flask(__name__)
 
@@ -14,185 +15,105 @@ app.config.update(
 )
 
 # Inisialisasi Celery
-celery = Celery(
-    app.import_name,
-    backend='rpc://',
-    broker='pyamqp://guest@rabbitmq//'
-)
+celery = Celery(app.import_name, backend='rpc://', broker='pyamqp://guest@rabbitmq//')
 
-# Inisialisasi dictionary untuk menyimpan status task
-task_status = {
-    'successful': [],
-    'failed': []
-}
+# Inisialisasi Redis
+redis_client = redis.StrictRedis(host='python-sqlmap-redis', port=6380, db=0, decode_responses=True)
+
+# Max task concurrency
+MAX_CONCURRENT_TASKS = 2
+
+def enqueue_task(task_id):
+    redis_client.rpush('task_queue', task_id)
+
+def dequeue_task():
+    return redis_client.lpop('task_queue')
+
+def update_task_status(task_id, status, progress=None):
+    redis_client.hset(f'task:{task_id}', mapping={'status': status, 'progress': progress or '0%'})
+
+def get_task_status(task_id):
+    return redis_client.hgetall(f'task:{task_id}')
+
+def task_can_run():
+    active_tasks = redis_client.llen('active_tasks')
+    return active_tasks < MAX_CONCURRENT_TASKS
+
+def add_active_task(task_id):
+    redis_client.rpush('active_tasks', task_id)
+
+def remove_active_task(task_id):
+    redis_client.lrem('active_tasks', 0, task_id)
 
 # Celery task to run SQLMap scan
 @celery.task(bind=True, name="app.run_sqlmap")
 def run_sqlmap(self, target_url, sqlmap_params=None):
+    task_id = self.request.id
+    update_task_status(task_id, 'RUNNING')
+    add_active_task(task_id)
+    
     try:
-        # Perbarui status awal
-        self.update_state(state="PROGRESS", meta={"progress": "Starting SQLMap scan..."})
-
-        # Tentukan file hasil JSON dan log
-        task_id = self.request.id
-       
-        # Default parameter: --batch (non-interactive mode)
         sqlmap_args = ['python3', '/sqlmap/sqlmap.py', '--url', target_url, '--batch']
-        
         if sqlmap_params:
-            if isinstance(sqlmap_params, str):
-                sqlmap_params = sqlmap_params.split()
-            sqlmap_args.extend(sqlmap_params)
-
-        # Jalankan SQLMap
-        process = subprocess.Popen(
-            sqlmap_args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        # Inisialisasi untuk menghitung total baris output
-        total_lines = 0
-        lines_processed = 0
-
-        # Buat daftar kosong untuk menampung baris output
+            sqlmap_args.extend(sqlmap_params.split())
+        
+        process = subprocess.Popen(sqlmap_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         lines = []
-
-        # Tulis setiap baris output ke file JSON dan log, serta hitung progres
         for line in process.stdout:
-            line = line.strip()  # Hapus spasi kosong
-
-            # Tambahkan baris ke daftar lines
+            line = line.strip()
             lines.append(line)
+            progress = f'{len(lines)} lines processed'
+            update_task_status(task_id, 'RUNNING', progress)
 
-             # Tentukan path file hasil
-            file_path = f'./results/{task_id}.txt'
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)  # Buat direktori jika belum ada
-
-            # Simpan hasil output ke dalam file teks
-            with open(file_path, 'w') as file:
-                file.write("\n".join(lines))  # Gabungkan baris menjadi teks dan tulis ke file
-            print(f"Task result saved to {file_path}")
-            
-            # Hitung persentase progres
-            lines_processed += 1
-            if total_lines == 0:
-                total_lines = 1  # Jangan biarkan total_lines 0 untuk menghindari pembagian dengan 0
-
-            progress_percentage = int((lines_processed / total_lines))
-
-            # Update progress (percentage)
-            self.update_state(
-                state="PROGRESS", 
-                meta={
-                    "progress": f"{progress_percentage}%",
-                    'logs':lines
-                }
-            )
-        # Tunggu proses selesai
         process.wait()
-
-        # Setelah proses selesai, simpan hasil ke file JSON
-        if process.returncode == 0:
-            output = {"status": "Completed", "log_file": lines}
-        else:
-            output = {"status": "Failed", "error": process.stderr.read().strip(), "log_file": lines}
-
-        return output
-
+        result_status = 'COMPLETED' if process.returncode == 0 else 'FAILED'
+        update_task_status(task_id, result_status)
+        with open(f'./results/{task_id}.txt', 'w') as f:
+            f.write('\n'.join(lines))
     except Exception as e:
-        return {"status": "Failed", "error": str(e)}
+        update_task_status(task_id, 'FAILED', str(e))
+        raise
+    finally:
+        remove_active_task(task_id)
+        next_task_id = dequeue_task()
+        if next_task_id:
+            run_sqlmap.apply_async(task_id=next_task_id)
 
-@app.route('/')
-def index():
-    return "SQLMap API is running!"
-
-# Route to start scan
 @app.route('/start-scan', methods=['POST'])
 def start_scan():
     data = request.json
     target_url = data.get('target_url')
-    sqlmap_params = data.get('sqlmap_params', [])  # Get SQLMap parameters, default to an empty list
+    sqlmap_params = data.get('sqlmap_params', '')
 
     if not target_url:
         return jsonify({'error': 'target_url is required'}), 400
 
-    # Memulai scan SQLMap dengan Celery
     task = run_sqlmap.apply_async(args=[target_url, sqlmap_params])
-    return jsonify({'message': 'Scan started', 'task_id': task.id}), 202
+    task_id = task.id
+    update_task_status(task_id, 'QUEUED')
+    
+    if task_can_run():
+        run_sqlmap.apply_async(args=[target_url, sqlmap_params], task_id=task_id)
+    else:
+        enqueue_task(task_id)
 
-
+    return jsonify({'message': 'Scan queued or started', 'task_id': task_id})
 
 @app.route('/scan-status/<task_id>', methods=['GET'])
 def scan_status(task_id):
-    task = run_sqlmap.AsyncResult(task_id)
-    # Menyiapkan response dengan status task
-    response = {
-        'task_id': task_id,
-        'status': task.status,  # Status task (PROGRESS, SUCCESS, FAILURE)
-        'progress': 'No progress available',
-        'result' : task.result
-    }
+    task_data = get_task_status(task_id)
+    return jsonify(task_data), 200
 
-    # If task info is available, get the progress
-    if task.info:
-        response['progress'] = task.info.get('progress', 'No progress available')
-
-    return jsonify(response)
-
-# Fungsi untuk menyimpan hasil task ke dalam file
-def save_task_result(task_id, result):
-    file_path = f'./logs/{task_id}.json'
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)  # Buat direktori jika belum ada
-    
-    with open(file_path, 'w') as file:
-        json.dump(result, file, indent=4)
-    print(f"Task result saved to {file_path}")
-
-# Menangani task sukses dan menyimpan hasil
-@signals.task_success.connect
-def task_success_handler(sender=None, result=None, **kwargs):
-    task_id = sender.request.id
-    print(f"Task {task_id} completed successfully.")
-    
-    # Simpan hasil task ke file
-    save_task_result(task_id, result)
-    
-    # Tambahkan task ke daftar 'successful'
-    task_status['successful'].append(task_id)
-
-# Menangani task gagal dan mencoba menjadwalkannya ulang
-@signals.task_failure.connect
-def task_failure_handler(sender=None, exception=None, **kwargs):
-    task_id = sender.request.id
-    print(f"Task {task_id} failed. Retrying...")
-    
-    # Tambahkan task ke daftar 'failed'
-    task_status['failed'].append(task_id)
-    
-    # Menjadwalkan ulang task yang gagal
-    sender.retry(countdown=10, max_retries=5)
-
-@app.route('/tasks', methods=['GET'], endpoint='get_all_tasks')
+@app.route('/tasks', methods=['GET'])
 def get_all_tasks():
-    # Inisialisasi Celery inspect
-    i = Inspect(app=celery)
-
-    # Ambil daftar tugas aktif, antrian, dan terjadwal
-    active_tasks = i.active() or {}
-    scheduled_tasks = i.reserved() or {}
-
-    # Struktur respons
-    response = {
+    queued_tasks = redis_client.lrange('task_queue', 0, -1)
+    active_tasks = redis_client.lrange('active_tasks', 0, -1)
+    return jsonify({
+        'queued': queued_tasks,
         'active': active_tasks,
-        'scheduled': scheduled_tasks,
-        'successful': task_status['successful'],
-        'failed': task_status['failed']
-    }
-
-    return jsonify(response), 200
-
+        'completed': redis_client.keys('task:*:status:COMPLETED'),
+        'failed': redis_client.keys('task:*:status:FAILED')
+    })
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0')
