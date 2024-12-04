@@ -115,5 +115,16 @@ def get_all_tasks():
         'failed': redis_client.keys('task:*:status:FAILED')
     })
 
+@app.route('/scan-result/<task_id>', methods=['GET'])
+def scan_result(task_id):
+    file_path = f'./results/{task_id}.txt'
+    if os.path.exists(file_path):
+        with open(file_path, 'r') as f:
+            result_content = f.read()
+        return jsonify({'task_id': task_id, 'result': result_content}), 200
+    else:
+        return jsonify({'error': 'Result file not found'}), 404
+
+
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0')
